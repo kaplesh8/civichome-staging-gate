@@ -1,0 +1,269 @@
+name: CivicHome PRS Staging Gate
+
+# STAGING GATE — the ONLY authorised path to the CivicHome PRS staging database.
+#
+# HARD BOUNDARIES (enforced here and in review):
+#   * workflow_dispatch with explicit, immutable inputs only. No push/PR/schedule triggers.
+#   * The product repository is FIXED to kaplesh8/easy-ui-bliss and checked out at an
+#     immutable, full 40-char SHA supplied as an input — never a branch.
+#   * The App installation token gets EXACTLY: contents: read + commit statuses: read on the
+#     product repo. No writes, anywhere, ever. It expires within the run.
+#   * NO staging secret is available before the `staging` job starts, and that job declares
+#     `environment: civicofhome-staging` — GitHub pauses it until a required reviewer who is
+#     NOT the dispatcher approves. The approval is recorded on the deployment and is
+#     independently verifiable:  gh api repos/<gate-repo>/actions/runs/<run_id>/approvals
+#   * The product SHA must carry a GREEN `ci/circleci: verify` commit status — the gate
+#     refuses to apply migrations to an unverified build.
+#   * The pinned migration manifest is verified (SHA-256) BEFORE anything is applied, and the
+#     identity preflight re-runs IMMEDIATELY BEFORE EACH migration.
+#   * Static checks (>=7 PASS / 0 FAIL), audit-immutability probe (>=3 PASS / 0 FAIL/CHECK),
+#     and a secret-leak scan of all logs (if: always()) must pass or the release is blocked.
+#   * No production anything: production ref is read only to prove inequality; never contacted.
+#   * Rollback: docs/OPERATOR_SETUP.md §8 (PITR-first). Never hand-edit to force green.
+#
+# This workflow NEVER merges PRs, NEVER deploys, NEVER enables payments, NEVER registers
+# anything with MHCLG. It is preparation for a human-approved staging run — nothing more.
+
+on:
+  workflow_dispatch:
+    inputs:
+      product_sha:
+        description: "IMMUTABLE full 40-char SHA of the product repo commit to apply (must have green ci/circleci: verify)"
+        required: true
+        type: string
+      staging_project_ref:
+        description: "Target staging project ref — must equal the SUPABASE_STAGING_PROJECT_REF secret (value not echoed)"
+        required: true
+        type: string
+      pitr_restore_point:
+        description: "Operator ATTESTATION (not verified proof) of a rehearsed backup/restore, e.g. 'PITR ok <ISO8601> project <ref> snapshot <id>; restore rehearsed <date>; approved by <name>'"
+        required: true
+        type: string
+      confirm_not_production:
+        description: "Type EXACTLY 'STAGING-NOT-PRODUCTION' to proceed"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read # read-only: environment protection assertion + approval inventory
+
+concurrency:
+  group: civicofhome-staging-gate
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Gate — input format validation (no secrets, no approval yet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate dispatch inputs (format only)
+        shell: bash
+        env:
+          PRODUCT_SHA: ${{ inputs.product_sha }}
+          STAGING_PROJECT_REF: ${{ inputs.staging_project_ref }}
+          PITR_RESTORE_POINT: ${{ inputs.pitr_restore_point }}
+          CONFIRM_NOT_PRODUCTION: ${{ inputs.confirm_not_production }}
+        run: node gate/validate-inputs.mjs
+      - name: Assert the gate environment EXISTS with REQUIRED REVIEWERS and BLOCKS admin bypass
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          envs_json="$(gh api "repos/${{ github.repository }}/environments")" || { echo "FATAL: cannot read environments API — refusing (fail closed)."; exit 1; }
+          summary="$(printf '%s' "$envs_json" | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for env in data.get("environments", []):
+              if env.get("name") == "civicofhome-staging":
+                  rules = env.get("protection_rules", [])
+                  rr = next((r for r in rules if r.get("type") == "required_reviewers"), None)
+                  reviewers = rr.get("reviewers", []) if isinstance(rr, dict) else []
+                  branch = next((r for r in rules if r.get("type") == "branch_policy"), None)
+                  can_bypass = env.get("can_admins_bypass")
+                  print("can_admins_bypass=" + ("true" if can_bypass is True else ("false" if can_bypass is False else "unknown")))
+                  print("required_reviewers=" + ("yes" if rr is not None else "no"))
+                  print("required_reviewer_count=" + str(len(reviewers)))
+                  print("deployment_branch_policy=" + ("yes" if branch is not None else "no"))
+                  break
+          else:
+              print("MISSING")
+          ')"
+          printf '%s\n' "$summary"
+          fail=0
+          if printf '%s\n' "$summary" | grep -qx "MISSING"; then echo "FATAL: environment civicofhome-staging does not exist — refusing to auto-create it."; fail=1; fi
+          if printf '%s\n' "$summary" | grep -qx "required_reviewers=no"; then echo "FATAL: no required_reviewers protection rule — refusing."; fail=1; fi
+          if printf '%s\n' "$summary" | grep -qx "required_reviewer_count=0"; then echo "FATAL: zero required reviewers — refusing."; fail=1; fi
+          if ! printf '%s\n' "$summary" | grep -qx "can_admins_bypass=false"; then echo "FATAL: administrator bypass not disabled — refusing."; fail=1; fi
+          if ! printf '%s\n' "$summary" | grep -qx "deployment_branch_policy=yes"; then echo "FATAL: no deployment branch policy — refusing."; fail=1; fi
+          [ "$fail" -eq 0 ] && echo "Gate environment protection gate PASSED."
+          [ "$fail" -ne 0 ] && exit 1
+
+  staging:
+    name: Staging apply — ONLY after independent reviewer approval
+    needs: preflight
+    runs-on: ubuntu-latest
+    environment: civicofhome-staging
+    steps:
+      - name: "Mint narrowly scoped App installation token (contents read, commit statuses read; NO writes)"
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: easy-ui-bliss
+          permission-contents: read
+          permission-commit-statuses: read
+          permission-metadata: read
+
+      - name: Checkout PINNED product commit (never a branch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kaplesh8/easy-ui-bliss
+          ref: ${{ inputs.product_sha }}
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+          path: product
+
+      - name: "Verify the product SHA carries a GREEN ci/circleci verify status"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PRODUCT_SHA: ${{ inputs.product_sha }}
+        run: |
+          set -euo pipefail
+          status_json="$(gh api "repos/kaplesh8/easy-ui-bliss/commits/${PRODUCT_SHA}/status")" || { echo "FATAL: cannot read commit status with the App token (needs Commit statuses: read) — refusing."; exit 1; }
+          ci_state="$(printf '%s' "$status_json" | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          for s in d.get("statuses", []):
+              if s.get("context") == "ci/circleci: verify":
+                  print(s.get("state", "unknown")); break
+          else:
+              print("missing")
+          ')"
+          echo "ci/circleci: verify @ $PRODUCT_SHA -> $ci_state"
+          if [ "$ci_state" != "success" ]; then
+            echo "FATAL: product SHA does not carry a green ci/circleci: verify status (got: $ci_state) — refusing to apply migrations to an unverified build."
+            exit 1
+          fi
+
+      - name: Identity preflight — refs, confirmation phrase, PITR attestation, DB URL (redacted)
+        working-directory: product
+        shell: bash
+        env:
+          SUPABASE_STAGING_PROJECT_REF: ${{ secrets.SUPABASE_STAGING_PROJECT_REF }}
+          SUPABASE_PRODUCTION_PROJECT_REF: ${{ secrets.SUPABASE_PRODUCTION_PROJECT_REF }}
+          SUPABASE_STAGING_DB_URL: ${{ secrets.SUPABASE_STAGING_DB_URL }}
+          INPUT_STAGING_PROJECT_REF: ${{ inputs.staging_project_ref }}
+          CONFIRM_NOT_PRODUCTION: ${{ inputs.confirm_not_production }}
+          PITR_RESTORE_POINT: ${{ inputs.pitr_restore_point }}
+        run: node scripts/prs-staging-identity.mjs
+
+      - name: Verify immutable migration SHA-256 manifest
+        working-directory: product
+        shell: bash
+        run: node scripts/prs-migration-manifest.mjs .
+
+      - name: Install PostgreSQL client + dnsutils
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client dnsutils
+
+      - name: Apply pinned migrations in manifest order — identity preflight IMMEDIATELY before EACH
+        working-directory: product
+        shell: bash
+        env:
+          DB_URL: ${{ secrets.SUPABASE_STAGING_DB_URL }}
+          SUPABASE_STAGING_DB_URL: ${{ secrets.SUPABASE_STAGING_DB_URL }}
+          SUPABASE_STAGING_PROJECT_REF: ${{ secrets.SUPABASE_STAGING_PROJECT_REF }}
+        run: |
+          set -euo pipefail
+          mapfile -t pinned < <(node scripts/prs-migration-manifest.mjs . --print-order | sed -n 's/^MIGRATION //p')
+          if [ "${#pinned[@]}" -lt 1 ]; then echo "FATAL: manifest yielded no migrations — refusing."; exit 1; fi
+          i=0
+          for migration in "${pinned[@]}"; do
+            i=$((i + 1))
+            echo "=== Migration $i/${#pinned[@]}: $migration ==="
+            echo "--- Independent DB identity preflight immediately BEFORE migration $i ---"
+            bash scripts/prs-staging-db-identity.sh
+            psql "${DB_URL}" -v ON_ERROR_STOP=1 --no-psqlrc -f "$migration" | tee "migration-$i.log"
+          done
+
+      - name: Post-apply STATIC checks — any [FAIL] blocks the release
+        working-directory: product
+        shell: bash
+        env:
+          DB_URL: ${{ secrets.SUPABASE_STAGING_DB_URL }}
+        run: |
+          set -euo pipefail
+          psql "${DB_URL}" --no-psqlrc -f docs/prs/staging/01_post_apply_static_checks.sql 2>&1 | tee static-checks.log
+          if grep -q '\[FAIL\]' static-checks.log; then echo "FATAL: static checks reported [FAIL] — DO NOT proceed."; exit 1; fi
+          pass_count=$(grep -c '\[PASS\]' static-checks.log || true)
+          echo "Static check PASS lines: ${pass_count}"
+          if [ "${pass_count}" -lt 7 ]; then echo "FATAL: fewer than 7 PASS lines — investigate before proceeding."; exit 1; fi
+
+      - name: Audit immutability probe — any [FAIL]/[CHECK] blocks the release
+        working-directory: product
+        shell: bash
+        env:
+          DB_URL: ${{ secrets.SUPABASE_STAGING_DB_URL }}
+        run: |
+          set -euo pipefail
+          psql "${DB_URL}" --no-psqlrc -f docs/prs/staging/02_audit_immutability_probe.sql 2>&1 | tee audit-probe.log
+          if grep -E '\[FAIL\]|\[CHECK\]' audit-probe.log; then echo "FATAL: audit immutability probe did not cleanly pass."; exit 1; fi
+          pass_count=$(grep -c '\[PASS\]' audit-probe.log || true)
+          echo "Audit probe PASS lines: ${pass_count}"
+          if [ "${pass_count}" -lt 3 ]; then echo "FATAL: expected at least 3 PASS lines (UPDATE/DELETE/TRUNCATE)."; exit 1; fi
+
+      - name: Secret-leak scan of verification logs (any hit blocks the release)
+        if: always()
+        working-directory: product
+        shell: bash
+        env:
+          SUPABASE_STAGING_DB_URL: ${{ secrets.SUPABASE_STAGING_DB_URL }}
+          SUPABASE_STAGING_PROJECT_REF: ${{ secrets.SUPABASE_STAGING_PROJECT_REF }}
+        run: |
+          set -euo pipefail
+          pw="$(node --input-type=module -e 'const raw=process.env.SUPABASE_STAGING_DB_URL??"";try{const u=new URL(raw);process.stdout.write(decodeURIComponent(u.password||""))}catch{process.exit(0)}')"
+          if [ -z "$pw" ]; then echo "FATAL: could not extract DB password for the scan needle — refusing to pass vacuously."; exit 1; fi
+          export SCAN_DB_PASSWORD="$pw"
+          export SCAN_LOG_FILES="$(ls migration-*.log static-checks.log audit-probe.log 2>/dev/null || true)"
+          if [ -z "$SCAN_LOG_FILES" ]; then echo "FATAL: no verification logs found — refusing to pass vacuously."; exit 1; fi
+          node scripts/prs-secret-scan.mjs
+
+      - name: Record approver identity (independent verification hook)
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Verify approvals independently: gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/approvals"
+
+      - name: Upload staging verification logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: civicofhome-staging-gate-logs
+          path: |
+            product/migration-*.log
+            product/static-checks.log
+            product/audit-probe.log
+          retention-days: 90
+
+  handoff:
+    name: Hand off to manual RLS/AAL2/storage matrix (not automatable here)
+    needs: staging
+    runs-on: ubuntu-latest
+    environment: civicofhome-staging
+    steps:
+      - name: Print the exact manual gate
+        run: |
+          echo "Migrations applied and probes passed (if this job ran)."
+          echo "NOT verified by this gate: authenticated RLS traffic, role escalation, AAL2,"
+          echo "storage signed-URL enforcement, malware E2E, Playwright vs staging, email."
+          echo "Execute the product repo docs/prs/PRS_STAGING_EXECUTION_PACK_2026-11-10.md §5-§12."
